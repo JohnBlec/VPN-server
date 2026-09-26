@@ -1,5 +1,11 @@
 # Run with the website compose.yml as the FIRST file. VPN_SERVER_DIR is an absolute path.
 services:
+  backend:
+    volumes:
+      - ${VPN_SERVER_DIR:?Set absolute path to VPN-server}/integration/secrets/agent_token:/run/secrets/vpn_agent_token:ro
+  vpn-worker:
+    volumes:
+      - ${VPN_SERVER_DIR:?Set absolute path to VPN-server}/integration/secrets/agent_token:/run/secrets/vpn_agent_token:ro
   vpn-tunnel:
     build: ${VPN_SERVER_DIR:?Set absolute path to VPN-server}/integration/ssh-tunnel
     network_mode: service:backend
