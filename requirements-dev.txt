@@ -1,0 +1,2 @@
+# Only for running controller tests outside the Debian runtime image.
+cryptography==50.0.1

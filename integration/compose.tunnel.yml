@@ -1,0 +1,26 @@
+# Run with the website compose.yml as the FIRST file. VPN_SERVER_DIR is an absolute path.
+services:
+  vpn-tunnel:
+    build: ${VPN_SERVER_DIR:?Set absolute path to VPN-server}/integration/ssh-tunnel
+    network_mode: service:backend
+    depends_on:
+      - backend
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /run/tunnel:mode=0700,size=1m,noexec,nosuid
+    environment:
+      VPN_SSH_HOST: ${VPN_SSH_HOST:?Set VPN_SSH_HOST}
+      VPN_SSH_PORT: ${VPN_SSH_PORT:-22}
+      VPN_SSH_USER: ${VPN_SSH_USER:-aegis-agent}
+    volumes:
+      - ${VPN_SERVER_DIR:?Set absolute path to VPN-server}/integration/secrets/id_ed25519:/secrets/id_ed25519:ro
+      - ${VPN_SERVER_DIR:?Set absolute path to VPN-server}/integration/secrets/known_hosts:/secrets/known_hosts:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

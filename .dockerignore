@@ -1,0 +1,8 @@
+.env
+data
+secrets
+backups
+exports
+tests
+__pycache__
+*.conf

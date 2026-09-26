@@ -1,0 +1,60 @@
+name: ${COMPOSE_PROJECT_NAME:-aegis-vpn}
+services:
+  vpn:
+    image: local/aegis-amneziawg:${VPN_IMAGE_TAG:-2026.09.25-1}
+    build:
+      context: .
+      args:
+        AWG_GO_COMMIT: ${AWG_GO_COMMIT:-b5928efb6ca19f0153958460c3d141f04abc5c2e}
+        AWG_TOOLS_COMMIT: ${AWG_TOOLS_COMMIT:-ee0f0a9aa34ff0a0da4b3433b9512781cfe02843}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /run:rw,noexec,nosuid,size=16m,mode=0755
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.all.forwarding: "0"
+    environment:
+      VPN_ENDPOINT: ${VPN_ENDPOINT:?Set VPN_ENDPOINT in .env}
+      VPN_PORT: ${VPN_PORT:-443}
+      VPN_SUBNET: ${VPN_SUBNET:-10.77.0.0/24}
+      VPN_DNS: ${VPN_DNS:-1.1.1.1,1.0.0.1}
+      VPN_MTU: ${VPN_MTU:-1280}
+      AGENT_TOKEN_FILE: /run/secrets/agent_token
+      CLIENT_KEY_FILE: /run/secrets/client_key
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${VPN_PORT:-443}:51820/udp"
+      - "127.0.0.1:${AGENT_PORT:-8787}:8787/tcp"
+    volumes:
+      - ./data:/var/lib/aegis-vpn
+    secrets:
+      - agent_token
+      - client_key
+    healthcheck:
+      test: [CMD, python3, /opt/aegis/agent.py, health]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+secrets:
+  agent_token:
+    file: ./secrets/agent_token
+  client_key:
+    file: ./secrets/client_key
