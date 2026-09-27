@@ -37,6 +37,6 @@ COPY --from=tools-build /src/src/wg /usr/local/bin/awg
 COPY --from=go-build /src/LICENSE /usr/share/doc/amneziawg-go/LICENSE
 COPY --from=tools-build /src/COPYING /usr/share/doc/amneziawg-tools/COPYING
 WORKDIR /opt/aegis
-COPY agent.py entrypoint.py ./
+COPY agent.py entrypoint.py traffic.py ./
 EXPOSE 51820/udp 8787/tcp
 ENTRYPOINT ["python3", "/opt/aegis/entrypoint.py"]

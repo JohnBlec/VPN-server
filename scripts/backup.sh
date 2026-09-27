@@ -35,7 +35,7 @@ docker image inspect "$image" --format '{{.Id}} {{json .RepoTags}}' > "$metadata
 if [[ "$running" == true ]]; then
   docker compose stop vpn
 fi
-tar -czf - .env secrets data compose.yml Dockerfile .dockerignore agent.py entrypoint.py -C "$metadata" image.txt \
+tar -czf - .env secrets data compose.yml Dockerfile .dockerignore agent.py entrypoint.py traffic.py -C "$metadata" image.txt \
   | age --recipient "$recipient" --output "$output/$name.partial"
 mv -- "$output/$name.partial" "$output/$name"
 printf 'Encrypted backup: %s\n' "$output/$name"

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -95,6 +96,36 @@ class Manager:
         self.runner = runner
         self.lock = threading.RLock()
         self.applied_revision = -1
+        self.traffic = None
+        self.traffic_error = ''
+        self.traffic_epoch = str(uuid.uuid4())
+
+    def enable_traffic(self):
+        from traffic import TrafficStore
+        self.traffic = TrafficStore(self.directory / 'traffic.sqlite3')
+
+    def sample_traffic(self):
+        if self.traffic is None:
+            return
+        with self.lock:
+            try:
+                transfers, handshakes = {}, {}
+                for line in self.runner('awg', 'show', INTERFACE, 'transfer').splitlines():
+                    key, rx, tx = line.split()
+                    rx, tx = int(rx), int(tx)
+                    if min(rx, tx) < 0 or max(rx, tx) > 2**63 - 1:
+                        raise ValueError()
+                    transfers[key] = (rx, tx)
+                for line in self.runner('awg', 'show', INTERFACE, 'latest-handshakes').splitlines():
+                    key, stamp = line.split()
+                    stamp = int(stamp)
+                    if stamp < 0 or stamp > int(datetime.now(timezone.utc).timestamp()) + 300:
+                        raise ValueError()
+                    handshakes[key] = stamp
+                self.traffic.sample(self.state['peers'].values(), transfers, handshakes, self.traffic_epoch)
+                self.traffic_error = ''
+            except Exception:
+                self.traffic_error = 'Traffic sampling failed; previous measurements retained.'
 
     def encrypt(self, value):
         return self.cipher.encrypt(value.encode()).decode()
@@ -170,6 +201,11 @@ class Manager:
                 raise APIError(503, 'Desired state saved; VPN apply failed. Retry the same peer ID.') from None
             finally:
                 config.unlink(missing_ok=True)
+            if self.traffic is not None:
+                try:
+                    self.traffic.removed([p['id'] for p in self.state['peers'].values() if not p['enabled']])
+                except Exception:
+                    self.traffic_error = 'Traffic counter reset could not be saved.'
 
     def ready(self):
         with self.lock:
@@ -228,6 +264,7 @@ class Manager:
         with self.lock:
             peer = self.get_peer(peer_id)
             if peer['enabled'] != data['enabled']:
+                self.sample_traffic()
                 peer['enabled'] = data['enabled']
                 self.state['revision'] += 1
                 self.save()
@@ -239,10 +276,16 @@ class Manager:
             raise APIError(400, 'Invalid peer ID')
         with self.lock:
             if peer_id in self.state['peers']:
+                self.sample_traffic()
                 del self.state['peers'][peer_id]
                 self.state['revision'] += 1
                 self.save()
             self.apply()
+            if self.traffic is not None:
+                try:
+                    self.traffic.removed([peer_id])
+                except Exception:
+                    self.traffic_error = 'Traffic counter reset could not be saved.'
             return {'deleted': True}
 
     def config(self, peer_id):
@@ -303,6 +346,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(data, dict):
                     raise APIError(400, 'JSON object required')
             with manager.lock:
+                if self.command == 'GET' and re.fullmatch(r'/v1/traffic\?after=[0-9]{1,19}', self.path):
+                    if manager.traffic is None:
+                        raise APIError(503, 'Traffic monitoring is not initialized')
+                    after = int(self.path.split('=')[1])
+                    if after > 2**63 - 1:
+                        raise APIError(400, 'Invalid cursor')
+                    snapshot = manager.traffic.snapshot(after, manager.state['peers'])
+                    snapshot['error'] = manager.traffic_error
+                    self.respond(200, snapshot)
+                    return
                 if self.command == 'GET' and self.path == '/v1/peers':
                     self.respond(200, {'peers': [manager.public_peer(p) for p in manager.state['peers'].values()],
                                        'revision': manager.state['revision'], 'applied_revision': manager.applied_revision})

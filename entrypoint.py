@@ -40,6 +40,11 @@ def main():
     token = Path(os.environ['AGENT_TOKEN_FILE']).read_text().strip()
     manager = Manager('/var/lib/aegis-vpn', cipher, settings)
     manager.initialize()
+    try:
+        manager.enable_traffic()
+    except Exception:
+        # Monitoring failure must not prevent existing VPN clients from connecting.
+        print('Traffic storage unavailable; VPN will start without monitoring. Restore traffic.sqlite3 and restart.', flush=True)
     stopping = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.set())
@@ -56,10 +61,12 @@ def main():
             raise RuntimeError('AmneziaWG control socket did not appear')
         configure_network(settings)
         manager.apply()
+        manager.sample_traffic()
         server = make_server(manager, token)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         print('Aegis VPN ready; control API on container port 8787.', flush=True)
         last_apply = time.monotonic()
+        last_traffic = time.monotonic()
         while not stopping.wait(1):
             if process.poll() is not None:
                 raise RuntimeError('AmneziaWG exited; container must restart')
@@ -69,10 +76,14 @@ def main():
                 except Exception:
                     print('VPN reconciliation failed; desired state retained for retry.', flush=True)
                 last_apply = time.monotonic()
+            if time.monotonic() - last_traffic >= 60:
+                manager.sample_traffic()
+                last_traffic = time.monotonic()
     finally:
         if server:
             server.shutdown()
             server.server_close()
+            manager.sample_traffic()
         process.terminate()
         try:
             process.wait(timeout=5)

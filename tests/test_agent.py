@@ -200,6 +200,13 @@ class ControllerTests(unittest.TestCase):
 
         self.assertEqual(200, request('/healthz', authenticated=False)[0])
         self.assertEqual(401, request('/v1/peers', authenticated=False)[0])
+        self.assertEqual(401, request('/v1/traffic?after=0', authenticated=False)[0])
+        self.manager.enable_traffic()
+        status, headers, payload = request('/v1/traffic?after=0')
+        self.assertEqual(200, status)
+        self.assertEqual('no-store', headers['Cache-Control'])
+        self.assertEqual([], json.loads(payload)['days'])
+        self.assertNotIn('private', payload)
         self.assertEqual(200, request('/v1/peers/phone', 'PUT', b'{}')[0])
         status, headers, profile = request('/v1/peers/phone/config')
         self.assertEqual(200, status)
@@ -210,6 +217,29 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(400, request('/v1/peers/phone', 'PUT', b' ' * 4097)[0])
         self.assertEqual(200, request('/v1/peers/phone', 'PATCH', b'{"enabled":false}')[0])
         self.assertEqual(403, request('/v1/peers/phone/config')[0])
+
+
+    def test_sampling_is_allowlisted_and_failure_preserves_previous_snapshot(self):
+        self.manager.create('phone', {})
+        self.manager.enable_traffic()
+        key = self.manager.get_peer('phone')['public_key']
+        calls = []
+        def runner(*args, **kwargs):
+            calls.append(args)
+            if args[-1] == 'transfer':
+                return f'{key}\t100\t200'
+            if args[-1] == 'latest-handshakes':
+                return f'{key}\t1700000000'
+            return self.runner(*args, **kwargs)
+        self.manager.runner = runner
+        self.manager.sample_traffic()
+        self.assertEqual([('awg', 'show', 'awg0', 'transfer'), ('awg', 'show', 'awg0', 'latest-handshakes')], calls)
+        before = self.manager.traffic.snapshot(0, ['phone'])
+        self.assertEqual(200, before['days'][0]['received'])
+        self.manager.runner = lambda *a, **kw: 'invalid'
+        self.manager.sample_traffic()
+        self.assertTrue(self.manager.traffic_error)
+        self.assertEqual(before, self.manager.traffic.snapshot(0, ['phone']))
 
 
 class SetupTests(unittest.TestCase):
