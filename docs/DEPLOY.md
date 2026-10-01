@@ -9,6 +9,8 @@
 На OpenVZ/LXC возможность TUN и нужных сетевых операций зависит от провайдера.
 
 Команды ниже выполняются **на новом Linux VPS**. Не на Windows и не на старом сервере.
+В примерах каталог VPN — `/opt/aegis-vpn`. Если выбрали `/root/VPN-server` или
+другой путь, используйте его во всех командах; каталоги VPN и сайта различаются.
 
 ```bash
 sudo apt update
@@ -56,16 +58,24 @@ install -d -m 700 /opt/aegis-vpn
 
 ## 3. Скопировать этот каталог
 
-С локального компьютера: комплект находится отдельно от сайта, в `D:\VPN-server`.
+С локального компьютера экспортируйте выбранную Git-версию комплекта отдельно от сайта.
+Подставьте путь к checkout; пример для Windows:
 
 ```powershell
-scp -r D:\VPN-server your-ssh-user@YOUR_VPS_IP:~/VPN-server-upload
+git -C D:\VPN-server archive --format=tar --output="$env:TEMP\aegis-vpn-kit.tar" HEAD
+scp "$env:TEMP\aegis-vpn-kit.tar" your-ssh-user@YOUR_VPS_IP:~/aegis-vpn-kit.tar
 ```
+
+`git archive HEAD` включает только файлы выбранного коммита. Нужные изменения должны
+входить в этот коммит; `.env`, данные, секреты, `.git` и локальные выгрузки не копируются.
+Для репозитория с настроенным доступом можно вместо архива клонировать его на VPS
+в пустой каталог и перейти к разделу 4.
 
 В root-сеансе VPS (подставьте пользователя):
 
 ```bash
-cp -a /home/your-ssh-user/VPN-server-upload/. /opt/aegis-vpn/
+test -z "$(ls -A /opt/aegis-vpn)" || { echo 'Deployment directory must be empty'; exit 1; }
+tar --extract --file=/home/your-ssh-user/aegis-vpn-kit.tar --directory=/opt/aegis-vpn --no-same-owner
 chown -R root:root /opt/aegis-vpn
 chmod 700 /opt/aegis-vpn
 cd /opt/aegis-vpn
@@ -154,7 +164,9 @@ docker compose exec -T vpn python3 /opt/aegis/agent.py config first-phone > expo
 2. DNS работает; IPv6 не выходит напрямую мимо туннеля.
 3. На VPS виден недавний handshake:
    `docker compose exec -T vpn awg show awg0 latest-handshakes`.
-4. Отключение `disable first-phone` действительно прекращает доступ, `enable` восстанавливает.
+4. Отключение действительно прекращает доступ, включение восстанавливает его:
+   `docker compose exec -T vpn python3 /opt/aegis/agent.py disable first-phone`,
+   затем та же команда с `enable first-phone`.
 5. После `docker compose restart vpn` и перезагрузки VPS старый файл продолжает работать.
 
 `healthy` проверяет локальную готовность, а не доступность UDP у провайдера и не обход
