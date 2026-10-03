@@ -58,32 +58,22 @@ install -d -m 700 /opt/aegis-vpn
 
 ## 3. Скопировать этот каталог
 
-С локального компьютера экспортируйте выбранную Git-версию комплекта отдельно от сайта.
-Подставьте путь к checkout; пример для Windows:
-
-```powershell
-git -C D:\VPN-server archive --format=tar --output="$env:TEMP\aegis-vpn-kit.tar" HEAD
-scp "$env:TEMP\aegis-vpn-kit.tar" your-ssh-user@YOUR_VPS_IP:~/aegis-vpn-kit.tar
-```
-
-`git archive HEAD` включает только файлы выбранного коммита. Нужные изменения должны
-входить в этот коммит; `.env`, данные, секреты, `.git` и локальные выгрузки не копируются.
-Для репозитория с настроенным доступом можно вместо архива клонировать его на VPS
-в пустой каталог и перейти к разделу 4.
-
-В root-сеансе VPS (подставьте пользователя):
+В консоли сервера пишем следующие команды для того, чтобы получить SSH-ключ:
 
 ```bash
-test -z "$(ls -A /opt/aegis-vpn)" || { echo 'Deployment directory must be empty'; exit 1; }
-tar --extract --file=/home/your-ssh-user/aegis-vpn-kit.tar --directory=/opt/aegis-vpn --no-same-owner
-chown -R root:root /opt/aegis-vpn
-chmod 700 /opt/aegis-vpn
-cd /opt/aegis-vpn
+ssh-keygen -t ed25519 -C "my-home-laptop"
+cat /root/.ssh/id_ed25519.pub
 ```
 
-Это команда **первого развёртывания**. При обновлениях не затирайте `.env`, `data/`
-и `secrets/` новой пустой копией; порядок обновления описан отдельно.
-Каталог самодостаточный: проекты ботов и PostgreSQL для VPN не нужны.
+Вместо `"my-home-laptop"` можете вставить любой другой комментарий или вовсе обойтись без него. После вывода последней команды данную строку вставляем в поле для SSH-ключа на сайте GitHub.
+
+В root-сеансе VPS:
+
+```bash
+ git clone git@github.com:JohnBlec/VPN-server.git
+```
+
+Проект успешно перенесли.
 
 ## 4. Внешний адрес и порты
 
@@ -109,7 +99,7 @@ UFW удалённо без правила для своего SSH-порта. D
 
 ```bash
 cd /opt/aegis-vpn
-python3 scripts/setup.py --endpoint vpn.your-domain.ru --port 443
+python3 scripts/setup.py --endpoint IP_ADDRESS_SERVER --port 443
 ```
 
 Подставьте настоящий адрес. Скрипт один раз создаёт `.env`, ключ шифрования и API-токен.
