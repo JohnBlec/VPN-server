@@ -17,11 +17,16 @@ import signal
 import subprocess
 import sys
 import threading
+import socket
+import socketserver
+import struct
+from http.server import BaseHTTPRequestHandler
 
 STATE = Path('/etc/aegis-relay')
 PROGRAM = Path('/usr/local/lib/aegis-relay/relay.py')
 UNIT = Path('/etc/systemd/system/aegis-relay.service')
 SYSCTL = Path('/etc/sysctl.d/70-aegis-relay.conf')
+CONTROL_DIR = Path('/var/lib/aegis-relay-control')
 SERVICE = '''[Unit]
 Description=Aegis UDP relay to foreign VPN servers
 Wants=network-online.target docker.service
@@ -233,10 +238,150 @@ def remove(port):
     print('Removed relay route. IP forwarding remains enabled for existing Docker/VPN traffic.')
 
 
+def mapping(route):
+    return {key: route[key] for key in ('public_ip', 'listen_port', 'target_ip', 'target_port')}
+
+
+def resolve_mapping(value):
+    if not isinstance(value, dict) or set(value) != {'public_ip', 'listen_port', 'target_ip', 'target_port'}:
+        raise ValueError('Укажите публичный IPv4 и UDP-порты обоих серверов.')
+    # Validate all supplied fields before they reach a system command.
+    route = validate_route({**value, 'interface': 'eth0', 'out_interface': 'eth0'})
+    addresses = json.loads(command('ip', '-j', '-4', 'address').stdout)
+    if any(a.get('local') == route['target_ip'] for item in addresses for a in item.get('addr_info', [])):
+        raise ValueError('Назначение должно находиться на другом VPS, а не на локальном интерфейсе Москвы.')
+    interface = next((item['ifname'] for item in addresses
+        if any(a.get('local') == route['public_ip'] for a in item.get('addr_info', []))), None)
+    if not interface:
+        raise ValueError('Указанный московский IPv4 не принадлежит этому серверу.')
+    route['interface'] = interface
+    route['out_interface'] = json.loads(command('ip', '-j', '-4', 'route', 'get', route['target_ip']).stdout)[0]['dev']
+    return validate_route(route)
+
+
+def replace_routes(current, desired):
+    """Apply a complete desired list; recover exact previous rules if persistence fails."""
+    if len({r['listen_port'] for r in desired}) != len(desired):
+        raise ValueError('Московский порт уже занят другим маршрутом.')
+    old_rules = {(t, c, tuple(r)) for route in current for t, c, r in rules(route)}
+    new_rules = {(t, c, tuple(r)) for route in desired for t, c, r in rules(route)}
+    try:
+        apply_routes(desired)
+        for table, chain, rule in old_rules - new_rules:
+            # Delete only rules absent from the new list, preserving shared filter rules.
+            for _ in range(100):
+                probe = iptables(table, '-C', chain, list(rule), check=False)
+                if probe.returncode == 1:
+                    break
+                if probe.returncode:
+                    raise RuntimeError('Не удалось проверить прежнее правило.')
+                iptables(table, '-D', chain, list(rule))
+        save_routes(desired)
+    except Exception:
+        for table, chain, rule in new_rules - old_rules:
+            iptables(table, '-D', chain, list(rule), check=False)
+        apply_routes(current)
+        raise
+
+
+def configure_mapping(previous, desired):
+    """Compare-and-set protects unrelated/manual routes and makes retries idempotent."""
+    if previous is not None and (not isinstance(previous, dict) or set(previous) != {'public_ip', 'listen_port', 'target_ip', 'target_port'}):
+        raise ValueError('Некорректные прежние параметры.')
+    old = validate_route({**previous, 'interface': 'eth0', 'out_interface': 'eth0'}) if previous is not None else None
+    new = resolve_mapping(desired) if desired is not None else None
+    with state_lock():
+        current = load_routes()
+        existing_new = next((r for r in current if new and r['listen_port'] == new['listen_port']), None)
+        if existing_new and mapping(existing_new) != mapping(new):
+            raise ValueError('Порт уже направлен на другой сервер. Сначала отключите прежний маршрут.')
+        existing_old = next((r for r in current if old and r['listen_port'] == old['listen_port']), None)
+        if existing_old and mapping(existing_old) != mapping(old):
+            raise ValueError('Прежние параметры не совпадают с правилами Москвы. Проверьте status ретранслятора.')
+        if new:
+            check_host(new)
+        remaining = [r for r in current if not (old and mapping(r) == mapping(old))]
+        if new and not any(mapping(r) == mapping(new) for r in remaining):
+            remaining.append(new)
+        replace_routes(current, remaining)
+        return {'applied': True, 'route': mapping(new) if new else None}
+
+
+def peer_allowed(connection, uid):
+    credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
+    _, actual_uid, _ = struct.unpack('3i', credentials)
+    return actual_uid in (0, uid)
+
+
+class ControlHandler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if not peer_allowed(self.connection, self.server.allowed_uid):
+            return self.reply(403, {'detail': 'Нет доступа к службе ретранслятора.'})
+        if self.path != '/v1/route':
+            return self.reply(404, {'detail': 'Неизвестная операция.'})
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 1 <= length <= 4096 or self.headers.get('Transfer-Encoding'):
+                raise ValueError('Некорректный размер запроса.')
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict) or set(payload) != {'previous', 'desired'}:
+                raise ValueError('Укажите previous и desired.')
+            self.reply(200, configure_mapping(payload['previous'], payload['desired']))
+        except (ValueError, TypeError) as exc:
+            self.reply(409, {'detail': str(exc) or 'Проверьте IPv4 и порты маршрута.'})
+        except (RuntimeError, OSError, KeyError, subprocess.TimeoutExpired) as exc:
+            print(f'Relay control failed ({type(exc).__name__}); inspect host rules.', file=sys.stderr, flush=True)
+            self.reply(503, {'detail': 'Не удалось применить правила на Москве. Проверьте журнал aegis-relay.'})
+
+
+class ControlServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    address_family = getattr(socket, 'AF_UNIX', None)
+    daemon_threads = False
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(5)
+        return connection, address
+
+
+def start_control():
+    if sys.platform != 'linux':
+        raise RuntimeError('Relay control socket requires Linux')
+    uid = int(os.environ.get('AEGIS_RELAY_API_UID', '10001'))
+    gid = int(os.environ.get('AEGIS_RELAY_API_GID', '10001'))
+    if uid <= 0 or gid <= 0:
+        raise ValueError('Invalid relay API UID/GID')
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+    os.chown(CONTROL_DIR, 0, gid)
+    CONTROL_DIR.chmod(0o750)
+    path = CONTROL_DIR / 'control.sock'
+    path.unlink(missing_ok=True)
+    server = ControlServer(str(path), ControlHandler)
+    server.allowed_uid = uid
+    os.chown(path, 0, gid)
+    path.chmod(0o660)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
 def run_service():
     stopping = threading.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: stopping.set())
+    control = start_control()
     try:
         while not stopping.is_set():
             try:
@@ -246,6 +391,9 @@ def run_service():
                 print(f'Relay apply failed; retrying in 15 seconds: {exc}', file=sys.stderr, flush=True)
             stopping.wait(15)
     finally:
+        control.shutdown()
+        control.server_close()
+        (CONTROL_DIR / 'control.sock').unlink(missing_ok=True)
         with state_lock():
             for route in load_routes():
                 try:

@@ -3,6 +3,9 @@ from contextlib import nullcontext
 import json
 from pathlib import Path
 import tempfile
+import socket
+import threading
+from http.client import HTTPConnection
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -102,6 +105,13 @@ class RelayRuleTests(unittest.TestCase):
         for tokens in (['--dport', '14443'], ['--dport', '14000:15000'], ['--dports', '443,14443,14444']):
             self.assertTrue(relay.matches_port(tokens, 14443))
         self.assertFalse(relay.matches_port(['--dport', '443'], 14443))
+
+    def test_control_rejects_a_target_on_another_local_public_address(self):
+        addresses = [{'ifname': 'eth0', 'addr_info': [{'local': '62.113.42.137'}, {'local': '83.171.225.80'}]}]
+        with patch.object(relay, 'command', return_value=result(stdout=json.dumps(addresses))) as command:
+            with self.assertRaisesRegex(ValueError, 'другом VPS'):
+                relay.resolve_mapping(relay.mapping(route()))
+        command.assert_called_once_with('ip', '-j', '-4', 'address')
 
 
 class RelayLifecycleTests(unittest.TestCase):
@@ -206,11 +216,128 @@ class RelayLifecycleTests(unittest.TestCase):
                 self.passes += 1
         with patch.object(relay.threading, 'Event', return_value=StopAfterTwoPasses()), \
                 patch.object(relay.signal, 'signal'), \
+                patch.object(relay, 'start_control'), \
+                patch.object(relay, 'CONTROL_DIR', relay.STATE), \
                 patch.object(relay, 'apply_routes', side_effect=[RuntimeError('Docker restarting'), None]) as apply, \
                 patch.object(relay, 'delete_rules') as delete:
             relay.run_service()
         self.assertEqual(2, apply.call_count)
         delete.assert_called_once_with(route())
+
+
+class ControlMappingTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.runtime = set()
+        for name, value in [('STATE', Path(directory.name)), ('state_lock', lambda: nullcontext()),
+                            ('check_host', lambda *args: None), ('command', lambda *args, **kw: result()),
+                            ('resolve_mapping', lambda value: relay.validate_route(route(**value)))]:
+            patcher = patch.object(relay, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        def iptables(table, operation, chain, rule, check=True):
+            key = (table, chain, tuple(rule[1:] if operation == '-I' else rule))
+            if operation == '-C':
+                return result(0 if key in self.runtime else 1)
+            if operation == '-I':
+                self.runtime.add(key)
+            elif operation == '-D':
+                self.runtime.discard(key)
+            return result()
+        patcher = patch.object(relay, 'iptables', side_effect=iptables)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_create_retry_move_and_delete_preserve_other_routes(self):
+        other = route(listen_port=14445, target_ip='45.9.18.245')
+        relay.save_routes([other])
+        self.runtime.update((t, c, tuple(r)) for t, c, r in relay.rules(other))
+        new = relay.mapping(route(listen_port=14446))
+        self.assertTrue(relay.configure_mapping(None, new)['applied'])
+        relay.configure_mapping(None, new)
+        self.assertEqual(2, len(relay.load_routes()))
+        moved = {**new, 'listen_port': 14447}
+        relay.configure_mapping(new, moved)
+        expected = {key for r in [other, route(listen_port=14447)] for t, c, args in relay.rules(r) for key in [(t, c, tuple(args))]}
+        self.assertEqual(expected, self.runtime)
+        relay.configure_mapping(moved, None)
+        relay.configure_mapping(moved, None)
+        self.assertEqual([other], relay.load_routes())
+        self.assertEqual({(t, c, tuple(r)) for t, c, r in relay.rules(other)}, self.runtime)
+
+    def test_wrong_target_cannot_overwrite_or_delete_an_existing_route(self):
+        relay.save_routes([route()])
+        wrong = relay.mapping(route(target_ip='45.9.18.245'))
+        for old, new in [(None, wrong), (wrong, None)]:
+            with self.assertRaises(ValueError):
+                relay.configure_mapping(old, new)
+        self.assertEqual([route()], relay.load_routes())
+
+    def test_failed_disk_write_restores_previous_rules_and_state(self):
+        existing = route()
+        relay.save_routes([existing])
+        self.runtime.update((t, c, tuple(r)) for t, c, r in relay.rules(existing))
+        before = set(self.runtime)
+        with patch.object(relay, 'save_routes', side_effect=OSError('disk full')):
+            with self.assertRaises(OSError):
+                relay.configure_mapping(relay.mapping(existing), relay.mapping(route(listen_port=14446)))
+        self.assertEqual(before, self.runtime)
+        self.assertEqual([existing], relay.load_routes())
+
+    def test_shared_filter_rule_survives_a_change_of_interface_metadata(self):
+        old, new = route(), route(out_interface='eth1')
+        relay.save_routes([old])
+        self.runtime.update((t, c, tuple(r)) for t, c, r in relay.rules(old))
+        relay.replace_routes([old], [new])
+        self.assertEqual({(t, c, tuple(r)) for t, c, r in relay.rules(new)}, self.runtime)
+
+
+class ControlProtocolTests(unittest.TestCase):
+    def setUp(self):
+        class LocalTestServer(relay.ControlServer):
+            address_family = socket.AF_INET
+        self.server = LocalTestServer(('127.0.0.1', 0), relay.ControlHandler)
+        self.server.allowed_uid = 10001
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, data, path='/v1/route'):
+        connection = HTTPConnection(*self.server.server_address, timeout=3)
+        try:
+            connection.request('POST', path, json.dumps(data))
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_peer_denied_before_any_rule_changes(self):
+        with patch.object(relay, 'peer_allowed', return_value=False), patch.object(relay, 'configure_mapping') as configure:
+            status, _ = self.post({'previous': None, 'desired': relay.mapping(route())})
+        self.assertEqual(403, status)
+        configure.assert_not_called()
+
+    def test_valid_request_has_confirmation_and_invalid_operations_do_not_execute(self):
+        desired = relay.mapping(route())
+        with patch.object(relay, 'peer_allowed', return_value=True), \
+                patch.object(relay, 'configure_mapping', return_value={'applied': True, 'route': desired}) as configure:
+            status, body = self.post({'previous': None, 'desired': desired})
+            self.assertEqual(200, status)
+            self.assertEqual(desired, body['route'])
+            self.assertEqual(409, self.post({'command': 'reboot'})[0])
+            self.assertEqual(404, self.post({}, '/v1/shell')[0])
+            self.assertEqual(409, self.post({'previous': None, 'desired': desired, 'extra': 'x' * 5000})[0])
+        configure.assert_called_once_with(None, desired)
+
+    def test_peer_credentials_require_root_or_the_backend_uid(self):
+        from unittest.mock import Mock
+        peer = Mock()
+        with patch.object(relay.socket, 'SO_PEERCRED', 17, create=True):
+            for uid, allowed in [(0, True), (10001, True), (10002, False)]:
+                peer.getsockopt.return_value = relay.struct.pack('3i', 123, uid, 10001)
+                self.assertEqual(allowed, relay.peer_allowed(peer, 10001))
 
 
 if __name__ == '__main__':
