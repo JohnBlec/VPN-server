@@ -70,7 +70,7 @@ cat /root/.ssh/id_ed25519.pub
 В root-сеансе VPS:
 
 ```bash
- git clone git@github.com:JohnBlec/VPN-server.git
+git clone git@github.com:JohnBlec/VPN-server.git
 ```
 
 Проект успешно перенесли.
